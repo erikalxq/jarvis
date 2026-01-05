@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8" />
+<title>Jarvis Core</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<style>
+html, body {
+    margin: 0;
+    padding: 0;
+    background: #000;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+}
+
+canvas {
+    width: 320px;
+    height: 120px;
+}
+
+#text {
+    margin-top: 28px;
+    max-width: 80%;
+    text-align: center;
+    font-size: 16px;
+    line-height: 1.6;
+    color: #9fdcdc;
+    opacity: 0;
+    transition: opacity 0.6s ease;
+}
+</style>
+</head>
+
+<body>
+<div id="container">
+    <canvas id="wave"></canvas>
+    <div id="text">轻声说话，观察它的反应</div>
+</div>
+
+<script>
+/* =========================
+   Canvas & DPI
+========================= */
+const canvas = document.getElementById('wave');
+const ctx = canvas.getContext('2d');
+
+const DPR = window.devicePixelRatio || 1;
+const W = 320;
+const H = 120;
+
+canvas.width = W * DPR;
+canvas.height = H * DPR;
+canvas.style.width = W + 'px';
+canvas.style.height = H + 'px';
+ctx.scale(DPR, DPR);
+
+/* =========================
+   状态
+========================= */
+const STATE = {
+    IDLE: 'idle',
+    LISTENING: 'listening'
+};
+let state = STATE.IDLE;
+
+/* =========================
+   生命参数
+========================= */
+let time = 0;
+let baseAmp = 10;
+let energy = 0;        // 声音能量池（0 ~ 1）
+let energyTarget = 0;
+
+/* =========================
+   音频分析
+========================= */
+let audioCtx, analyser, dataArray;
+
+async function initAudio() {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    audioCtx = new AudioContext();
+    const source = audioCtx.createMediaStreamSource(stream);
+
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+
+    dataArray = new Uint8Array(analyser.fftSize);
+    source.connect(analyser);
+}
+
+/* =========================
+   计算 RMS 音量
+========================= */
+function computeEnergy() {
+    if (!analyser) return;
+
+    analyser.getByteTimeDomainData(dataArray);
+    let sum = 0;
+    for (let i = 0; i < dataArray.length; i++) {
+        const v = (dataArray[i] - 128) / 128;
+        sum += v * v;
+    }
+    const rms = Math.sqrt(sum / dataArray.length);
+
+    // 非线性放大 + 限制
+    energyTarget = Math.min(1, rms * 3);
+}
+
+/* =========================
+   平滑噪声
+========================= */
+const seed = Math.random() * 1000;
+function softNoise(x) {
+    return (
+        Math.sin(x * 0.8 + seed) * 0.6 +
+        Math.sin(x * 1.7 + seed * 2.1) * 0.3 +
+        Math.sin(x * 3.1 + seed * 0.7) * 0.1
+    );
+}
+
+/* =========================
+   采样波形
+========================= */
+function sampleWave(amp) {
+    const points = [];
+    const centerY = H / 2;
+
+    for (let x = 0; x <= W; x += 1) {
+        const nx = x * 0.02;
+        const v =
+            Math.sin(nx + time) * 0.5 +
+            Math.sin(nx * 2.2 + time * 1.4) * 0.3 +
+            softNoise(nx + time) * 0.2;
+
+        const fade = Math.exp(-Math.pow((x - W / 2) / 150, 2));
+        points.push({
+            x,
+            y: centerY + v * amp * fade
+        });
+    }
+    return points;
+}
+
+/* =========================
+   绘制平滑曲线
+========================= */
+function drawSmoothLine(points, alpha, width) {
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+
+    for (let i = 1; i < points.length - 2; i++) {
+        const xc = (points[i].x + points[i + 1].x) / 2;
+        const yc = (points[i].y + points[i + 1].y) / 2;
+        ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
+    }
+
+    ctx.strokeStyle = `rgba(0, 255, 255, ${alpha})`;
+    ctx.lineWidth = width;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+}
+
+/* =========================
+   主循环
+========================= */
+function render() {
+    ctx.clearRect(0, 0, W, H);
+
+    computeEnergy();
+
+    // 能量池平滑（生命惯性）
+    energy += (energyTarget - energy) * 0.08;
+    energy *= 0.98; // 自然衰减
+
+    const amp = baseAmp + energy * 30;
+    const points = sampleWave(amp);
+
+    drawSmoothLine(points, 0.15, 6);
+    drawSmoothLine(points, 0.35, 3);
+    drawSmoothLine(points, 0.85, 1.5);
+
+    time += 0.012 + energy * 0.02;
+    requestAnimationFrame(render);
+}
+
+/* =========================
+   交互：点击唤醒
+========================= */
+document.body.addEventListener('click', async () => {
+    if (!audioCtx) {
+        await initAudio();
+        state = STATE.LISTENING;
+        document.getElementById('text').style.opacity = 0;
+    }
+});
+
+/* =========================
+   启动
+========================= */
+render();
+</script>
+</body>
+</html>
