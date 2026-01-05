@@ -33,11 +33,11 @@ canvas {
     margin-top: 28px;
     max-width: 80%;
     text-align: center;
-    font-size: 16px;
+    font-size: 15px;
     line-height: 1.6;
     color: #9fdcdc;
-    opacity: 0;
-    transition: opacity 0.6s ease;
+    opacity: 1;
+    transition: opacity 0.5s ease;
 }
 </style>
 </head>
@@ -45,7 +45,7 @@ canvas {
 <body>
 <div id="container">
     <canvas id="wave"></canvas>
-    <div id="text">轻声说话，观察它的反应</div>
+    <div id="text">点击唤醒，让我听到你的声音</div>
 </div>
 
 <script>
@@ -75,17 +75,20 @@ const STATE = {
 let state = STATE.IDLE;
 
 /* =========================
-   生命参数
+   文案
 ========================= */
-let time = 0;
-let baseAmp = 10;
-let energy = 0;        // 声音能量池（0 ~ 1）
-let energyTarget = 0;
+const textEl = document.getElementById('text');
+
+function setText(t) {
+    textEl.textContent = t;
+    textEl.style.opacity = 1;
+}
 
 /* =========================
-   音频分析
+   音频
 ========================= */
 let audioCtx, analyser, dataArray;
+let lastSoundTime = 0;
 
 async function initAudio() {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -94,54 +97,59 @@ async function initAudio() {
 
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
-
     dataArray = new Uint8Array(analyser.fftSize);
+
     source.connect(analyser);
 }
 
 /* =========================
-   计算 RMS 音量
+   声音能量
 ========================= */
-function computeEnergy() {
+let energy = 0;
+let energyTarget = 0;
+
+function updateEnergy() {
     if (!analyser) return;
 
     analyser.getByteTimeDomainData(dataArray);
     let sum = 0;
+
     for (let i = 0; i < dataArray.length; i++) {
         const v = (dataArray[i] - 128) / 128;
         sum += v * v;
     }
-    const rms = Math.sqrt(sum / dataArray.length);
 
-    // 非线性放大 + 限制
+    const rms = Math.sqrt(sum / dataArray.length);
     energyTarget = Math.min(1, rms * 3);
+
+    if (energyTarget > 0.02) {
+        lastSoundTime = performance.now();
+    }
 }
 
 /* =========================
-   平滑噪声
+   波形基础
 ========================= */
+let time = 0;
+const baseAmp = 8;
+
 const seed = Math.random() * 1000;
-function softNoise(x) {
+function softNoise(x, k = 1) {
     return (
-        Math.sin(x * 0.8 + seed) * 0.6 +
-        Math.sin(x * 1.7 + seed * 2.1) * 0.3 +
-        Math.sin(x * 3.1 + seed * 0.7) * 0.1
+        Math.sin(x * 0.8 * k + seed) * 0.6 +
+        Math.sin(x * 1.6 * k + seed * 2) * 0.3
     );
 }
 
-/* =========================
-   采样波形
-========================= */
-function sampleWave(amp) {
+function sampleWave(amp, freqMul, phase) {
     const points = [];
     const centerY = H / 2;
 
     for (let x = 0; x <= W; x += 1) {
-        const nx = x * 0.02;
+        const nx = x * 0.02 * freqMul;
         const v =
-            Math.sin(nx + time) * 0.5 +
-            Math.sin(nx * 2.2 + time * 1.4) * 0.3 +
-            softNoise(nx + time) * 0.2;
+            Math.sin(nx + time + phase) * 0.6 +
+            softNoise(nx + time, freqMul) * 0.4;
 
         const fade = Math.exp(-Math.pow((x - W / 2) / 150, 2));
         points.push({
@@ -153,9 +161,9 @@ function sampleWave(amp) {
 }
 
 /* =========================
-   绘制平滑曲线
+   绘制曲线
 ========================= */
-function drawSmoothLine(points, alpha, width) {
+function drawLine(points, alpha, width) {
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
 
@@ -165,7 +173,7 @@ function drawSmoothLine(points, alpha, width) {
         ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
     }
 
-    ctx.strokeStyle = `rgba(0, 255, 255, ${alpha})`;
+    ctx.strokeStyle = `rgba(0,255,255,${alpha})`;
     ctx.lineWidth = width;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -178,32 +186,49 @@ function drawSmoothLine(points, alpha, width) {
 function render() {
     ctx.clearRect(0, 0, W, H);
 
-    computeEnergy();
+    updateEnergy();
 
-    // 能量池平滑（生命惯性）
+    // 能量平滑 + 衰减
     energy += (energyTarget - energy) * 0.08;
-    energy *= 0.98; // 自然衰减
+    energy *= 0.96;
 
-    const amp = baseAmp + energy * 30;
-    const points = sampleWave(amp);
+    // Idle 几乎不动
+    const activeEnergy = state === STATE.LISTENING ? energy : 0.02;
+    const amp = baseAmp + activeEnergy * 28;
 
-    drawSmoothLine(points, 0.15, 6);
-    drawSmoothLine(points, 0.35, 3);
-    drawSmoothLine(points, 0.85, 1.5);
+    // 三条不同“生命层”
+    const main = sampleWave(amp, 1.0, 0);
+    const thin1 = sampleWave(amp * 0.6, 1.4, 1.7);
+    const thin2 = sampleWave(amp * 0.45, 0.8, -2.3);
 
-    time += 0.012 + energy * 0.02;
+    drawLine(thin1, 0.25, 1);
+    drawLine(thin2, 0.25, 1);
+    drawLine(main, 0.9, 1.8);
+
+    // Listening 超时检测（3 秒无声）
+    if (
+        state === STATE.LISTENING &&
+        performance.now() - lastSoundTime > 3000
+    ) {
+        state = STATE.IDLE;
+        setText('点击唤醒，让我听到你的声音');
+    }
+
+    time += 0.012 + activeEnergy * 0.02;
     requestAnimationFrame(render);
 }
 
 /* =========================
-   交互：点击唤醒
+   点击交互
 ========================= */
 document.body.addEventListener('click', async () => {
     if (!audioCtx) {
         await initAudio();
-        state = STATE.LISTENING;
-        document.getElementById('text').style.opacity = 100;
     }
+
+    state = STATE.LISTENING;
+    lastSoundTime = performance.now();
+    setText('我在，请说');
 });
 
 /* =========================
