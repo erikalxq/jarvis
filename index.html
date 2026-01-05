@@ -120,9 +120,12 @@ function updateEnergy() {
     }
 
     const rms = Math.sqrt(sum / dataArray.length);
-    energyTarget = Math.min(1, rms * 3);
 
-    if (energyTarget > 0.02) {
+    // Sensitivity multiplier: increase to make small sounds more visible
+    energyTarget = Math.min(1, rms * 6);
+
+    // Lower the threshold so quieter sounds update the lastSoundTime
+    if (energyTarget > 0.008) {
         lastSoundTime = performance.now();
     }
 }
@@ -131,7 +134,7 @@ function updateEnergy() {
    波形基础
 ========================= */
 let time = 0;
-const baseAmp = 8;
+const baseAmp = 10;
 
 const seed = Math.random() * 1000;
 function softNoise(x, k = 1) {
@@ -189,12 +192,14 @@ function render() {
     updateEnergy();
 
     // 能量平滑 + 衰减
-    energy += (energyTarget - energy) * 0.08;
-    energy *= 0.96;
+    // 更快地跟随目标值，并且衰减更慢以保留更大的可视幅度
+    energy += (energyTarget - energy) * 0.12;
+    energy *= 0.985;
 
     // Idle 几乎不动
     const activeEnergy = state === STATE.LISTENING ? energy : 0.02;
-    const amp = baseAmp + activeEnergy * 28;
+    // 增大能量对幅度的影响，使波动更明显
+    const amp = baseAmp + activeEnergy * 40;
 
     // 三条不同“生命层”
     const main = sampleWave(amp, 1.0, 0);
