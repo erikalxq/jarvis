@@ -88,12 +88,16 @@ function setText(t) {
    音频
 ========================= */
 let audioCtx, analyser, dataArray;
+let micStream = null;   // 新增：保存 MediaStream
 let lastSoundTime = 0;
 
 async function initAudio() {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // 如果已经有 stream 就直接复用
+    if (micStream && audioCtx) return;
+
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     audioCtx = new AudioContext();
-    const source = audioCtx.createMediaStreamSource(stream);
+    const source = audioCtx.createMediaStreamSource(micStream);
 
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
@@ -125,8 +129,8 @@ function updateEnergy() {
     energyTarget = Math.min(1, rms * 6);
 
     // Lower the threshold so quieter sounds update the lastSoundTime
-    if (energyTarget > 0.008) {
-        lastSoundTime = performance.now();
+    if (energyTarget > 0.02) {
+        //lastSoundTime = performance.now();
     }
 }
 
@@ -183,6 +187,58 @@ function drawLine(points, alpha, width) {
     ctx.stroke();
 }
 
+
+let mediaRecorder = null;
+let audioChunks = [];
+async function sendToSTT(blob) {
+    alert('将发送录音到服务器(/api/transcribe)进行语音识别，确认后继续');
+
+    const formData = new FormData();
+    formData.append('audio', blob);
+
+    const res = await fetch('/api/transcribe', {
+        method: 'POST',
+        body: formData
+    });
+
+    const data = await res.json();
+    setText(`你刚才说的是：\n“${data.text}”`);
+}
+
+function stopRecordingAndCleanup() {
+    // 停止 mediaRecorder 并在 onstop 时提交数据
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.onstop = async () => {
+            const blob = new Blob(audioChunks, { type: 'audio/webm' });
+            await sendToSTT(blob);
+        };
+        try {
+            mediaRecorder.stop();
+        } catch (e) {
+            console.warn('mediaRecorder stop error', e);
+        }
+    }
+
+    // 停止所有麦克风轨道
+    if (micStream) {
+        micStream.getTracks().forEach(track => {
+            try { track.stop(); } catch (e) {}
+        });
+        micStream = null;
+    }
+
+    // 关闭 audioCtx，释放资源
+    if (audioCtx) {
+        try { audioCtx.close(); } catch (e) {}
+        audioCtx = null;
+        analyser = null;
+        dataArray = null;
+    }
+
+    mediaRecorder = null;
+    audioChunks = [];
+}
+
 /* =========================
    主循环
 ========================= */
@@ -217,6 +273,9 @@ function render() {
     ) {
         state = STATE.IDLE;
         setText('点击唤醒，让我听到你的声音');
+
+        // 停止录音并发送已录制数据
+        stopRecordingAndCleanup();
     }
 
     time += 0.012 + activeEnergy * 0.02;
@@ -227,8 +286,23 @@ function render() {
    点击交互
 ========================= */
 document.body.addEventListener('click', async () => {
-    if (!audioCtx) {
+    // 初始化并复用同一流
+    if (!micStream || !audioCtx) {
         await initAudio();
+    }
+
+    // 如果还没有在录音，创建并开始
+    if (!mediaRecorder || mediaRecorder.state === 'inactive') {
+        mediaRecorder = new MediaRecorder(micStream);
+        audioChunks = [];
+
+        mediaRecorder.ondataavailable = e => {
+            alert('录音数据可用，大小：' + e.data.size + ' 字节');
+            if (e.data.size > 0) audioChunks.push(e.data);
+        };
+
+        mediaRecorder.start();
+        alert('mediaRecorder 启动，开始录音。');
     }
 
     state = STATE.LISTENING;
