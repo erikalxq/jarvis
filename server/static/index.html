@@ -70,9 +70,11 @@ ctx.scale(DPR, DPR);
 ========================= */
 const STATE = {
     IDLE: 'idle',
-    LISTENING: 'listening'
+    LISTENING: 'listening',
+    THINKING: 'thinking'
 };
 let state = STATE.IDLE;
+let prevState = null;
 
 /* =========================
    文案
@@ -126,11 +128,11 @@ function updateEnergy() {
     const rms = Math.sqrt(sum / dataArray.length);
 
     // Sensitivity multiplier: increase to make small sounds more visible
-    energyTarget = Math.min(1, rms * 6);
+    energyTarget = Math.min(1, rms * 20);
 
     // Lower the threshold so quieter sounds update the lastSoundTime
-    if (energyTarget > 0.02) {
-        //lastSoundTime = performance.now();
+    if (energyTarget > 0.2) {
+        lastSoundTime = performance.now();
     }
 }
 
@@ -170,7 +172,7 @@ function sampleWave(amp, freqMul, phase) {
 /* =========================
    绘制曲线
 ========================= */
-function drawLine(points, alpha, width) {
+function drawLine(points, alpha, width, color = '0,255,255') {
     ctx.beginPath();
     ctx.moveTo(points[0].x, points[0].y);
 
@@ -180,7 +182,7 @@ function drawLine(points, alpha, width) {
         ctx.quadraticCurveTo(points[i].x, points[i].y, xc, yc);
     }
 
-    ctx.strokeStyle = `rgba(0,255,255,${alpha})`;
+    ctx.strokeStyle = `rgba(${color},${alpha})`;
     ctx.lineWidth = width;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -191,18 +193,36 @@ function drawLine(points, alpha, width) {
 let mediaRecorder = null;
 let audioChunks = [];
 async function sendToSTT(blob) {
-    alert('将发送录音到服务器(/api/transcribe)进行语音识别，确认后继续');
+    // 切换到 THINKING 状态并更新文案
+    prevState = state;
+    state = STATE.THINKING;
+    setText('思考中，请稍后');
 
     const formData = new FormData();
     formData.append('audio', blob);
 
-    const res = await fetch('/api/transcribe', {
-        method: 'POST',
-        body: formData
-    });
+    try {
+        const res = await fetch('/api/transcribe', {
+            method: 'POST',
+            body: formData
+        });
 
-    const data = await res.json();
-    setText(`你刚才说的是：\n“${data.text}”`);
+        if (!res.ok) {
+            const txt = await res.text();
+            console.error('transcribe failed:', res.status, txt);
+            setText('识别失败，请稍后重试');
+            return;
+        }
+
+        const data = await res.json();
+        setText(`你刚才说的是：\n“${data.text}”`);
+    } catch (err) {
+        console.error('sendToSTT error', err);
+        setText('识别失败，请稍后重试');
+    } finally {
+        // 恢复到空闲状态（也可以恢复到 prevState，如果需要）
+        state = STATE.IDLE;
+    }
 }
 
 function stopRecordingAndCleanup() {
@@ -258,13 +278,21 @@ function render() {
     const amp = baseAmp + activeEnergy * 40;
 
     // 三条不同“生命层”
+    // 三条不同“生命层”
     const main = sampleWave(amp, 1.0, 0);
     const thin1 = sampleWave(amp * 0.6, 1.4, 1.7);
     const thin2 = sampleWave(amp * 0.45, 0.8, -2.3);
 
-    drawLine(thin1, 0.25, 1);
-    drawLine(thin2, 0.25, 1);
-    drawLine(main, 0.9, 1.8);
+    // 根据状态改变颜色/透明度/线宽，THINKING 时使用柔和黄色并降低动画频率
+    if (state === STATE.THINKING) {
+        drawLine(thin1, 0.18, 1, '255,200,100');
+        drawLine(thin2, 0.18, 1, '255,200,100');
+        drawLine(main, 0.7, 2.2, '255,220,140');
+    } else {
+        drawLine(thin1, 0.25, 1);
+        drawLine(thin2, 0.25, 1);
+        drawLine(main, 0.9, 1.8);
+    }
 
     // Listening 超时检测（3 秒无声）
     if (
@@ -286,6 +314,9 @@ function render() {
    点击交互
 ========================= */
 document.body.addEventListener('click', async () => {
+    if (state === STATE.LISTENING || state === STATE.THINKING) 
+        return;
+    
     // 初始化并复用同一流
     if (!micStream || !audioCtx) {
         await initAudio();
@@ -297,17 +328,15 @@ document.body.addEventListener('click', async () => {
         audioChunks = [];
 
         mediaRecorder.ondataavailable = e => {
-            alert('录音数据可用，大小：' + e.data.size + ' 字节');
             if (e.data.size > 0) audioChunks.push(e.data);
         };
 
         mediaRecorder.start();
-        alert('mediaRecorder 启动，开始录音。');
-    }
 
-    state = STATE.LISTENING;
-    lastSoundTime = performance.now();
-    setText('我在，请说');
+        state = STATE.LISTENING;
+        lastSoundTime = performance.now();
+        setText('我在，请说');
+    }  
 });
 
 /* =========================
