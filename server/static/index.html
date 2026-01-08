@@ -189,7 +189,44 @@ function drawLine(points, alpha, width, color = '0,255,255') {
     ctx.stroke();
 }
 
+/* =========================
+   流式文字
+========================= */
+let buffer = [];
+let fullText = "";
 
+async function streamChat(text) {
+    buffer = [];
+    fullText = "";
+    setText("");
+
+    const res = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text })
+    });
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        //弹消息框显示
+        alert("收到消息：" + decoder.decode(value));
+
+        const chunk = decoder.decode(value);
+        chunk.split("\n").forEach(line => {
+            if (line.startsWith("data: "))
+                buffer.push(line.replace("data: ", ""));
+        });
+    }
+}
+
+
+/* =========================
+   录音 & 发送到 STT
+========================= */
 let mediaRecorder = null;
 let audioChunks = [];
 async function sendToSTT(blob) {
@@ -215,7 +252,8 @@ async function sendToSTT(blob) {
         }
 
         const data = await res.json();
-        setText(`你刚才说的是：\n“${data.text}”`);
+        onSttFinish(data);
+        // setText(`你刚才说的是：\n“${data.text}”`);
     } catch (err) {
         console.error('sendToSTT error', err);
         setText('识别失败，请稍后重试');
@@ -223,6 +261,13 @@ async function sendToSTT(blob) {
         // 恢复到空闲状态（也可以恢复到 prevState，如果需要）
         state = STATE.IDLE;
     }
+}
+
+/* =========================
+   录音结束
+========================= */
+function onSttFinish(sttText) {
+    streamChat(sttText);
 }
 
 function stopRecordingAndCleanup() {
@@ -271,6 +316,12 @@ function render() {
     // 更快地跟随目标值，并且衰减更慢以保留更大的可视幅度
     energy += (energyTarget - energy) * 0.12;
     energy *= 0.985;
+
+    if (buffer.length > 0) {
+        fullText += buffer.shift();
+        setText(fullText);
+        energyTarget = Math.min(1, energyTarget + 0.2);
+    }
 
     // Idle 几乎不动
     const activeEnergy = state === STATE.LISTENING ? energy : 0.02;

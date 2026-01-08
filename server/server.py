@@ -1,12 +1,17 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
+import asyncio
 import whisper
 import tempfile
 import os
 import subprocess
 import traceback
+import random
 from pathlib import Path
+from pydantic import BaseModel
+from fastapi import Request
 
 app = FastAPI()
 
@@ -18,6 +23,12 @@ PROJECT_ROOT = BASE_DIR.parent
 model = None
 MODEL_NAME = os.getenv('WHISPER_MODEL', 'small')
 
+FAKE_RESPONSES = [
+    "你好，我在。刚才我清楚地听见了你的声音。",
+    "我正在思考你说的话，这对我来说很有意义。",
+    "你可以慢慢说，我会一直在这里听着。",
+    "这听起来很有趣，也许我们可以继续聊下去。",
+]
 
 @app.on_event('startup')
 def load_model():
@@ -96,3 +107,41 @@ async def transcribe(audio: UploadFile = File(...)):
                     print(f'Removed temp file: {p}')
             except Exception as e:
                 print('Failed to remove temp file', p, e)
+
+
+@app.post("/api/chat/stream")
+async def fake_chat_stream(request: Request):
+    """
+    Accepts either JSON {"text": "..."} or form-data with field 'text'.
+    Returns a server-sent event stream (SSE) that yields the answer character-by-character.
+    """
+    text = None
+
+    # Try to parse JSON first
+    try:
+        content_type = request.headers.get('content-type', '')
+        if 'application/json' in content_type:
+            body = await request.json()
+            if isinstance(body, dict):
+                text = body.get('text')
+                print('chat stream body text:', text)
+    except Exception as e:
+        print('Failed to parse request body for /api/chat/stream:', e)
+
+    if not text:
+        # Return a clear validation error instead of FastAPI's generic 422
+        raise HTTPException(status_code=422, detail="Request must include 'text' (JSON or form-data)")
+
+    if isinstance(text, dict):
+        answer = text.get('text')
+        print('answer:', answer)
+
+    async def generator():
+        for ch in answer:
+            yield f"data: {ch}\n\n"
+            await asyncio.sleep(random.uniform(0.03, 0.12))
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream"
+    )
