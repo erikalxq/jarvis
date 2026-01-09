@@ -10,8 +10,9 @@ import subprocess
 import traceback
 import random
 from pathlib import Path
-from pydantic import BaseModel
 from fastapi import Request
+import numpy as np
+import time
 
 app = FastAPI()
 
@@ -144,4 +145,92 @@ async def fake_chat_stream(request: Request):
     return StreamingResponse(
         generator(),
         media_type="text/event-stream"
+    )
+
+
+SAMPLE_RATE = 16000
+def fake_tts_stream(text: str):
+    """
+    模拟 TTS：
+    - 不是真语音
+    - 但是真·音频流（PCM 16bit）
+    """
+    # Produce more expressive synthetic audio with simple DSP:
+    # - variable per-character duration
+    # - pitch changes (glide + vibrato)
+    # - amplitude envelope (attack/decay)
+    # - second harmonic and subtle noise to make timbre richer
+    # - occasional pauses (breaths)
+
+    base_freq = 220.0
+    rng = np.random.default_rng(abs(hash(text)) % (2**32))
+
+    for i, ch in enumerate(text):
+        # small chance of a short pause for punctuation or breath
+        if ch in '.，,!?。！？' and rng.random() < 0.8:
+            pause_dur = 0.12 + rng.random() * 0.18
+            t = np.linspace(0, pause_dur, int(SAMPLE_RATE * pause_dur), endpoint=False)
+            silence = np.zeros_like(t)
+            pcm16 = (silence * 32767).astype(np.int16)
+            yield pcm16.tobytes()
+            time.sleep(pause_dur * 0.25)
+
+        # duration and expressive modifiers
+        duration_per_char = 0.06 + rng.random() * 0.12
+        # pitch varies by position and random small offset
+        freq = base_freq * (0.9 + 0.3 * rng.random()) * (1.0 + 0.02 * np.sin(i))
+
+        # vibrato + glide
+        vibrato_rate = 5.0 + rng.random() * 6.0
+        vibrato_depth = 0.003 + rng.random() * 0.01
+        glide = (0.98 + rng.random() * 0.04)
+
+        t = np.linspace(0, duration_per_char, int(SAMPLE_RATE * duration_per_char), endpoint=False)
+
+        # instantaneous frequency with vibrato and slow glide
+        inst_freq = freq * (glide ** (t * 10)) * (1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t))
+        phase = 2 * np.pi * np.cumsum(inst_freq) / SAMPLE_RATE
+        carrier = np.sin(phase)
+
+        # second harmonic and subtle noise for timbre
+        harmonic = 0.4 * np.sin(2 * phase)
+        noise = (rng.standard_normal(len(t)) * 0.012)
+
+        # amplitude envelope (attack/decay)
+        attack = int(0.01 * SAMPLE_RATE)
+        release = int(0.03 * SAMPLE_RATE)
+        env = np.ones_like(t)
+        if len(t) > 0:
+            if attack < len(t):
+                env[:attack] = np.linspace(0.0, 1.0, attack)
+            if release < len(t):
+                env[-release:] = np.linspace(1.0, 0.0, release)
+
+        # expressive amplitude based on position and randomness
+        amp = 0.15 + 0.05 * rng.random() + 0.1 * np.clip(np.sin(i * 0.4), 0, 1)
+
+        wave = amp * env * (carrier + harmonic) + noise * amp
+
+        # occasionally add a stronger emphasis (like a stressed syllable)
+        if rng.random() < 0.08:
+            emphasize_len = int(0.02 * SAMPLE_RATE)
+            if emphasize_len < len(wave):
+                wave[:emphasize_len] += 0.08 * np.sin(2 * np.pi * (freq * 1.2) * t[:emphasize_len])
+
+        pcm16 = np.clip(wave * 32767, -32768, 32767).astype(np.int16)
+
+        # yield in moderately sized chunks to help smooth analyser updates
+        chunk_size = int(0.05 * SAMPLE_RATE)  # 50ms chunks
+        for start in range(0, len(pcm16), chunk_size):
+            end = min(start + chunk_size, len(pcm16))
+            yield pcm16[start:end].tobytes()
+            # simulate asynchronous generation latency (small)
+            time.sleep(0.01 + rng.random() * 0.02)
+
+
+@app.get("/api/tts-stream")
+def tts_stream(text: str):
+    return StreamingResponse(
+        fake_tts_stream(text),
+        media_type="audio/pcm"
     )

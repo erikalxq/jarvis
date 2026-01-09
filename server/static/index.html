@@ -48,6 +48,11 @@ canvas {
     <div id="text">点击唤醒，让我听到你的声音</div>
 </div>
 
+<div id="controls" style="position:fixed; right:16px; top:16px; color:#9fdcdc;">
+    <input id="ttsInput" type="text" placeholder="测试 TTS 文本" style="width:220px;padding:6px;border-radius:4px;border:1px solid #333;background:#000;color:#9fdcdc;" />
+    <button id="ttsPlayBtn" style="margin-left:6px;padding:6px 10px;border-radius:4px;border:1px solid #333;background:#073;background-color:#063;color:#fff;">播放 TTS</button>
+</div>
+
 <script>
 /* =========================
    Canvas & DPI
@@ -71,10 +76,14 @@ ctx.scale(DPR, DPR);
 const STATE = {
     IDLE: 'idle',
     LISTENING: 'listening',
-    THINKING: 'thinking'
+    THINKING: 'thinking',
+    SPEAKING: 'speaking'
 };
 let state = STATE.IDLE;
 let prevState = null;
+let ttsAudioCtx = null;
+let ttsAnalyser = null;
+let ttsDataArray = null;
 
 /* =========================
    文案
@@ -92,6 +101,7 @@ function setText(t) {
 let audioCtx, analyser, dataArray;
 let micStream = null;   // 新增：保存 MediaStream
 let lastSoundTime = 0;
+let micDataArray = null;
 
 async function initAudio() {
     // 如果已经有 stream 就直接复用
@@ -103,7 +113,10 @@ async function initAudio() {
 
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
-    dataArray = new Uint8Array(analyser.fftSize);
+    // make mic analyser a bit smoother but responsive
+    analyser.smoothingTimeConstant = 0.3;
+    analyser.minDecibels = -90;
+    micDataArray = new Uint8Array(analyser.fftSize);
 
     source.connect(analyser);
 }
@@ -115,23 +128,37 @@ let energy = 0;
 let energyTarget = 0;
 
 function updateEnergy() {
-    if (!analyser) return;
+    // Choose analyser depending on current state (mic when listening, tts when speaking)
+    let srcAnalyser = null;
+    let srcArray = null;
+    if (state === STATE.LISTENING && analyser) {
+        srcAnalyser = analyser;
+        srcArray = micDataArray;
+    } else if (state === STATE.SPEAKING && ttsAnalyser) {
+        srcAnalyser = ttsAnalyser;
+        srcArray = ttsDataArray;
+    } else if (analyser) {
+        // fallback to mic analyser in other states if available
+        srcAnalyser = analyser;
+        srcArray = micDataArray;
+    }
 
-    analyser.getByteTimeDomainData(dataArray);
+    if (!srcAnalyser || !srcArray) return;
+
+    srcAnalyser.getByteTimeDomainData(srcArray);
     let sum = 0;
-
-    for (let i = 0; i < dataArray.length; i++) {
-        const v = (dataArray[i] - 128) / 128;
+    for (let i = 0; i < srcArray.length; i++) {
+        const v = (srcArray[i] - 128) / 128;
         sum += v * v;
     }
 
-    const rms = Math.sqrt(sum / dataArray.length);
+    const rms = Math.sqrt(sum / srcArray.length);
 
     // Sensitivity multiplier: increase to make small sounds more visible
     energyTarget = Math.min(1, rms * 20);
 
-    // Lower the threshold so quieter sounds update the lastSoundTime
-    if (energyTarget > 0.2) {
+    // Update lastSoundTime when loud enough (for listening timeout)
+    if (state === STATE.LISTENING && energyTarget > 0.2) {
         lastSoundTime = performance.now();
     }
 }
@@ -199,7 +226,6 @@ async function streamChat(text) {
     buffer = [];
     fullText = "";
     setText("");
-
     const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -208,19 +234,21 @@ async function streamChat(text) {
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-
+    let resultText = '';
     while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        //弹消息框显示
-        alert("收到消息：" + decoder.decode(value));
-
         const chunk = decoder.decode(value);
         chunk.split("\n").forEach(line => {
-            if (line.startsWith("data: "))
-                buffer.push(line.replace("data: ", ""));
+            if (line.startsWith("data: ")) {
+                const piece = line.replace("data: ", "");
+                buffer.push(piece);
+                resultText += piece;
+            }
         });
     }
+
+    return resultText;
 }
 
 
@@ -263,11 +291,106 @@ async function sendToSTT(blob) {
     }
 }
 
+// Play streamed PCM16 audio from /api/tts-stream?text=...
+async function playTTSStream(text) {
+    if (!text) return;
+
+    // close previous ttsAudioCtx if any
+    try {
+        if (ttsAudioCtx && ttsAudioCtx.state !== 'closed') {
+            ttsAudioCtx.close();
+        }
+    } catch (e) {}
+
+    ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    ttsAnalyser = ttsAudioCtx.createAnalyser();
+    ttsAnalyser.fftSize = 512;
+    // make TTS analyser very responsive
+    ttsAnalyser.smoothingTimeConstant = 0.05;
+    ttsAnalyser.minDecibels = -100;
+    ttsDataArray = new Uint8Array(ttsAnalyser.fftSize);
+
+    const gain = ttsAudioCtx.createGain();
+    gain.gain.value = 1.0;
+    ttsAnalyser.connect(gain);
+    gain.connect(ttsAudioCtx.destination);
+
+    // set state to SPEAKING
+    prevState = state;
+    state = STATE.SPEAKING;
+    setText('播放语音中...');
+
+    const url = '/api/tts-stream?text=' + encodeURIComponent(text);
+    const res = await fetch(url);
+    if (!res.ok || !res.body) {
+        console.error('TTS stream fetch failed', res.status);
+        state = prevState || STATE.IDLE;
+        return;
+    }
+
+    const reader = res.body.getReader();
+    const SAMPLE_RATE = 16000;
+
+    // We'll schedule buffers sequentially
+    let playTime = ttsAudioCtx.currentTime + 0.05;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+
+            // value is Uint8Array of PCM16 bytes
+            const ab = value.buffer;
+            // Ensure we interpret as little-endian 16-bit
+            const tmpView = new DataView(ab);
+            const int16 = new Int16Array(ab.byteLength / 2);
+            for (let i = 0; i < int16.length; i++) {
+                int16[i] = tmpView.getInt16(i * 2, true);
+            }
+
+            const float32 = new Float32Array(int16.length);
+            for (let i = 0; i < int16.length; i++) {
+                float32[i] = int16[i] / 32768;
+            }
+
+            const buffer = ttsAudioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+            buffer.copyToChannel(float32, 0, 0);
+
+            const src = ttsAudioCtx.createBufferSource();
+            src.buffer = buffer;
+            src.connect(ttsAnalyser);
+            // analyser is already connected to gain -> destination
+            src.start(playTime);
+            playTime += buffer.duration;
+        }
+    } catch (e) {
+        console.error('Error reading TTS stream', e);
+    } finally {
+        // let any remaining scheduled buffers play out, then restore state
+        const now = ttsAudioCtx.currentTime;
+        const timeUntilEnd = Math.max(0, playTime - now);
+        setTimeout(() => {
+            // close tts audio context
+            try { ttsAudioCtx.close(); } catch (e) {}
+            ttsAudioCtx = null;
+            ttsAnalyser = null;
+            ttsDataArray = null;
+            state = prevState || STATE.IDLE;
+            setText('点击唤醒，让我听到你的声音');
+        }, (timeUntilEnd + 0.1) * 1000);
+    }
+}
+
 /* =========================
    录音结束
 ========================= */
-function onSttFinish(sttText) {
-    streamChat(sttText);
+async function onSttFinish(sttText) {
+    const reply = await streamChat(sttText);
+    // after streaming response text to UI, play TTS for the reply
+    // reply may be empty if streaming failed
+    if (reply && reply.length > 0) {
+        playTTSStream(reply);
+    }
 }
 
 function stopRecordingAndCleanup() {
@@ -304,6 +427,7 @@ function stopRecordingAndCleanup() {
     audioChunks = [];
 }
 
+
 /* =========================
    主循环
 ========================= */
@@ -323,8 +447,8 @@ function render() {
         energyTarget = Math.min(1, energyTarget + 0.2);
     }
 
-    // Idle 几乎不动
-    const activeEnergy = state === STATE.LISTENING ? energy : 0.02;
+    // Idle 几乎不动；在 SPEAKING 时也使用能量以显示播放时的波形
+    const activeEnergy = (state === STATE.LISTENING || state === STATE.SPEAKING) ? energy : 0.02;
     // 增大能量对幅度的影响，使波动更明显
     const amp = baseAmp + activeEnergy * 40;
 
@@ -365,7 +489,7 @@ function render() {
    点击交互
 ========================= */
 document.body.addEventListener('click', async () => {
-    if (state === STATE.LISTENING || state === STATE.THINKING) 
+    if (state === STATE.LISTENING || state === STATE.THINKING || state === STATE.SPEAKING) 
         return;
     
     // 初始化并复用同一流
@@ -388,6 +512,18 @@ document.body.addEventListener('click', async () => {
         lastSoundTime = performance.now();
         setText('我在，请说');
     }  
+});
+
+// tts play button
+const ttsPlayBtn = document.getElementById('ttsPlayBtn');
+const ttsInput = document.getElementById('ttsInput');
+ttsPlayBtn.addEventListener('click', async () => {
+    const txt = (ttsInput && ttsInput.value) ? ttsInput.value.trim() : '';
+    if (!txt) return;
+    // if currently recording or thinking, ignore
+    if (state === STATE.LISTENING || state === STATE.THINKING) return;
+    // play the tts stream and let waveform update
+    await playTTSStream(txt);
 });
 
 /* =========================

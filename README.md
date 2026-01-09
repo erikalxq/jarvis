@@ -17,3 +17,5 @@ venv311\Scripts\activate
 
 重新安装依赖（在 venv311 里）
 pip install fastapi uvicorn openai-whisper
+
+git push origin main
