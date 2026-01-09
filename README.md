@@ -19,3 +19,15 @@ venv311\Scripts\activate
 pip install fastapi uvicorn openai-whisper
 
 git push origin main
+
+# to do
+一个“情绪驱动的 TTS JSON 协议”
+LLM 生成韵律示例
+
+安装 OpenTTS + Coqui
+pip install --upgrade pip
+pip install TTS
+
+如何启动 OpenTTS
+方法一（推荐）：直接用 CLI
+opentts --host 0.0.0.0 --port 5500
