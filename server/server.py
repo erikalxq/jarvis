@@ -13,8 +13,50 @@ from pathlib import Path
 from fastapi import Request
 import numpy as np
 import time
+import shutil
+# Optional TTS / torch support: import lazily and tolerate absence so the server
+# still starts when the environment doesn't have those packages installed.
+tts_available = False
+tts_engine = None
+try:
+    from TTS.api import TTS
+    tts_available = True
+    print('TTS package available')
+except Exception as e:
+    print('TTS package not available; continuing without it:', e)
+
+# Torch safe-global allowlisting is helpful when loading some TTS checkpoints.
+# Only attempt if torch is present.
+try:
+    import torch
+    import collections
+    try:
+        # allowlist common globals used in checkpoints
+        torch.serialization.add_safe_globals([collections.defaultdict, dict])
+        print("Added collections.defaultdict to torch safe globals")
+    except Exception as e:
+        print("Warning: couldn't add collections.defaultdict to safe globals:", e)
+
+    try:
+        # 先导入定义 RAdam 的模块，再把类加入 safe globals（如果可用）
+        from TTS.utils.radam import RAdam
+        try:
+            torch.serialization.add_safe_globals([RAdam])
+            print("Added RAdam to torch safe globals")
+        except Exception as e:
+            print("Warning: couldn't add safe globals for RAdam:", e)
+    except Exception:
+        # not fatal
+        pass
+except Exception as e:
+    print('torch not available or failed to import; skipping torch-safe-global setup:', e)
 
 app = FastAPI()
+
+# Detect ffmpeg availability so we can choose to stream raw PCM or return WAV
+FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None
+if not FFMPEG_AVAILABLE:
+    print('ffmpeg not found in PATH: server will return WAV container when possible')
 
 # Project paths
 BASE_DIR = Path(__file__).resolve().parent
@@ -136,6 +178,8 @@ async def fake_chat_stream(request: Request):
     if isinstance(text, dict):
         answer = text.get('text')
         print('answer:', answer)
+    else:
+        answer = text
 
     async def generator():
         for ch in answer:
@@ -162,75 +206,102 @@ def fake_tts_stream(text: str):
     # - second harmonic and subtle noise to make timbre richer
     # - occasional pauses (breaths)
 
-    base_freq = 220.0
-    rng = np.random.default_rng(abs(hash(text)) % (2**32))
+    # Real TTS: synthesize to a temp WAV using local TTS engine, then stream 16k PCM via ffmpeg
+    global tts_engine
+    # use provided text when present, otherwise use a default sentence
+    synth_text = text if text and str(text).strip() else "这是一个本地 TTS 测试语音。"
 
-    for i, ch in enumerate(text):
-        # small chance of a short pause for punctuation or breath
-        if ch in '.，,!?。！？' and rng.random() < 0.8:
-            pause_dur = 0.12 + rng.random() * 0.18
-            t = np.linspace(0, pause_dur, int(SAMPLE_RATE * pause_dur), endpoint=False)
-            silence = np.zeros_like(t)
-            pcm16 = (silence * 32767).astype(np.int16)
-            yield pcm16.tobytes()
-            time.sleep(pause_dur * 0.25)
+    # lazy init TTS engine if available; if not available, fall back to simple silence
+    global tts_engine, tts_available
+    if not tts_available:
+        # no TTS package installed in this environment — yield short silence as fallback
+        silence = (np.zeros(int(0.35 * SAMPLE_RATE))).astype(np.int16)
+        yield silence.tobytes()
+        return
 
-        # duration and expressive modifiers
-        duration_per_char = 0.06 + rng.random() * 0.12
-        # pitch varies by position and random small offset
-        freq = base_freq * (0.9 + 0.3 * rng.random()) * (1.0 + 0.02 * np.sin(i))
+    if tts_engine is None:
+        try:
+            tts_engine = TTS(model_name="tts_models/zh-CN/baker/tacotron2-DDC-GST", progress_bar=False)
+        except Exception as e:
+            print('Failed to initialize TTS engine:', e)
+            # disable further attempts and fallback to silence
+            tts_available = False
+            silence = (np.zeros(int(0.35 * SAMPLE_RATE))).astype(np.int16)
+            yield silence.tobytes()
+            return
 
-        # vibrato + glide
-        vibrato_rate = 5.0 + rng.random() * 6.0
-        vibrato_depth = 0.003 + rng.random() * 0.01
-        glide = (0.98 + rng.random() * 0.04)
+    tmp_wav = None
+    proc = None
+    try:
+        # synthesize WAV file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as f:
+            tmp_wav = f.name
 
-        t = np.linspace(0, duration_per_char, int(SAMPLE_RATE * duration_per_char), endpoint=False)
+        tts_engine.tts_to_file(text=synth_text, file_path=tmp_wav)
+        print(f'Synthesized TTS to temporary WAV: {tmp_wav}')
 
-        # instantaneous frequency with vibrato and slow glide
-        inst_freq = freq * (glide ** (t * 10)) * (1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t))
-        phase = 2 * np.pi * np.cumsum(inst_freq) / SAMPLE_RATE
-        carrier = np.sin(phase)
+        # convert to 16k PCM signed 16 little-endian via ffmpeg to stdout
+        ffmpeg_cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', tmp_wav,
+            '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '1', '-ar', str(SAMPLE_RATE), '-'
+        ]
 
-        # second harmonic and subtle noise for timbre
-        harmonic = 0.4 * np.sin(2 * phase)
-        noise = (rng.standard_normal(len(t)) * 0.012)
+        # If ffmpeg isn't available on this host, return the WAV container as a fallback
+        # (the client will detect content-type and play accordingly).
+        if not FFMPEG_AVAILABLE:
+            with open(tmp_wav, 'rb') as wf:
+                while True:
+                    chunk = wf.read(4096)
+                    if not chunk:
+                        break
+                    yield chunk
+            return
 
-        # amplitude envelope (attack/decay)
-        attack = int(0.01 * SAMPLE_RATE)
-        release = int(0.03 * SAMPLE_RATE)
-        env = np.ones_like(t)
-        if len(t) > 0:
-            if attack < len(t):
-                env[:attack] = np.linspace(0.0, 1.0, attack)
-            if release < len(t):
-                env[-release:] = np.linspace(1.0, 0.0, release)
+        try:
+            proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            # race condition: ffmpeg disappeared between check and run; fall back to WAV
+            with open(tmp_wav, 'rb') as wf:
+                while True:
+                    chunk = wf.read(4096)
+                    if not chunk:
+                        break
+                    yield chunk
+            return
 
-        # expressive amplitude based on position and randomness
-        amp = 0.15 + 0.05 * rng.random() + 0.1 * np.clip(np.sin(i * 0.4), 0, 1)
+        # stream from process stdout in chunks
+        while True:
+            chunk = proc.stdout.read(4096)
+            if not chunk:
+                break
+            yield chunk
 
-        wave = amp * env * (carrier + harmonic) + noise * amp
-
-        # occasionally add a stronger emphasis (like a stressed syllable)
-        if rng.random() < 0.08:
-            emphasize_len = int(0.02 * SAMPLE_RATE)
-            if emphasize_len < len(wave):
-                wave[:emphasize_len] += 0.08 * np.sin(2 * np.pi * (freq * 1.2) * t[:emphasize_len])
-
-        pcm16 = np.clip(wave * 32767, -32768, 32767).astype(np.int16)
-
-        # yield in moderately sized chunks to help smooth analyser updates
-        chunk_size = int(0.05 * SAMPLE_RATE)  # 50ms chunks
-        for start in range(0, len(pcm16), chunk_size):
-            end = min(start + chunk_size, len(pcm16))
-            yield pcm16[start:end].tobytes()
-            # simulate asynchronous generation latency (small)
-            time.sleep(0.01 + rng.random() * 0.02)
+        # wait for process to finish
+        if proc:
+            proc.stdout.close()
+            proc.wait()
+    finally:
+        try:
+            if proc and proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            if tmp_wav and os.path.exists(tmp_wav):
+                os.remove(tmp_wav)
+        except Exception:
+            pass
 
 
 @app.get("/api/tts-stream")
 def tts_stream(text: str):
+    # If ffmpeg is available we stream raw PCM (s16le, 16k mono) so frontend can
+    # decode and schedule audio buffers for low-latency playback. If ffmpeg is not
+    # available, the generator will return a WAV container and we must set the
+    # content-type accordingly so the client can decode it via decodeAudioData or
+    # by creating an Audio element from a Blob.
+    media_type = "audio/pcm" if FFMPEG_AVAILABLE else "audio/wav"
     return StreamingResponse(
         fake_tts_stream(text),
-        media_type="audio/pcm"
+        media_type=media_type
     )

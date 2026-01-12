@@ -328,6 +328,45 @@ async function playTTSStream(text) {
         return;
     }
 
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+
+    // If the server returned a WAV container (fallback when ffmpeg isn't available),
+    // read the full blob and decode it via decodeAudioData for reliable playback.
+    if (contentType.includes('audio/wav') || contentType.includes('audio/x-wav')) {
+        try {
+            const blob = await res.blob();
+            const arrayBuffer = await blob.arrayBuffer();
+            const audioBuffer = await ttsAudioCtx.decodeAudioData(arrayBuffer);
+
+            const src = ttsAudioCtx.createBufferSource();
+            src.buffer = audioBuffer;
+            src.connect(ttsAnalyser);
+            src.start(ttsAudioCtx.currentTime + 0.05);
+
+            // when playback ends, restore state
+            src.onended = () => {
+                try { ttsAudioCtx.close(); } catch (e) {}
+                ttsAudioCtx = null;
+                ttsAnalyser = null;
+                ttsDataArray = null;
+                state = prevState || STATE.IDLE;
+                setText('点击唤醒，让我听到你的声音');
+            };
+        } catch (e) {
+            console.error('Error decoding WAV blob from TTS stream', e);
+            try { ttsAudioCtx.close(); } catch (er) {}
+            ttsAudioCtx = null;
+            ttsAnalyser = null;
+            ttsDataArray = null;
+            state = prevState || STATE.IDLE;
+            setText('播放失败');
+        }
+        return;
+    }
+
+    // Otherwise we expect raw PCM (s16le) streamed in chunks. Make sure to honor
+    // the Uint8Array.byteOffset when creating a DataView — using value.buffer alone
+    // can result in misaligned reads and noisy audio.
     const reader = res.body.getReader();
     const SAMPLE_RATE = 16000;
 
@@ -339,13 +378,12 @@ async function playTTSStream(text) {
             if (done) break;
             if (!value) continue;
 
-            // value is Uint8Array of PCM16 bytes
-            const ab = value.buffer;
-            // Ensure we interpret as little-endian 16-bit
-            const tmpView = new DataView(ab);
-            const int16 = new Int16Array(ab.byteLength / 2);
+            // value is a Uint8Array view; use value.byteOffset/byteLength to construct
+            // a DataView that points to the actual bytes we received.
+            const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+            const int16 = new Int16Array(value.byteLength / 2);
             for (let i = 0; i < int16.length; i++) {
-                int16[i] = tmpView.getInt16(i * 2, true);
+                int16[i] = view.getInt16(i * 2, true);
             }
 
             const float32 = new Float32Array(int16.length);
