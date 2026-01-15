@@ -210,6 +210,7 @@ def fake_tts_stream(text: str):
     global tts_engine
     # use provided text when present, otherwise use a default sentence
     synth_text = text if text and str(text).strip() else "这是一个本地 TTS 测试语音。"
+    synth_text += "。"
 
     # lazy init TTS engine if available; if not available, fall back to simple silence
     global tts_engine, tts_available
@@ -242,8 +243,9 @@ def fake_tts_stream(text: str):
 
         # convert to 16k PCM signed 16 little-endian via ffmpeg to stdout
         ffmpeg_cmd = [
-            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', tmp_wav,
-            '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '1', '-ar', str(SAMPLE_RATE), '-'
+            'ffmpeg', '-hide_banner', '-loglevel', 'error', '-i', tmp_wav,
+            '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '1', '-ar', str(SAMPLE_RATE), 
+            '-fflags', 'nobuffer', '-flags', 'low_delay', '-flush_packets', '1','-'
         ]
 
         # If ffmpeg isn't available on this host, return the WAV container as a fallback
@@ -274,6 +276,9 @@ def fake_tts_stream(text: str):
             chunk = proc.stdout.read(4096)
             if not chunk:
                 break
+
+            if len(chunk) % 2 != 0:
+                chunk = chunk[:-1]
             yield chunk
 
         # wait for process to finish

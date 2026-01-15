@@ -373,49 +373,67 @@ async function playTTSStream(text) {
     // We'll schedule buffers sequentially
     let playTime = ttsAudioCtx.currentTime + 0.05;
     try {
+        let leftover = null;
+        let lastSource = null;
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            if (!value) continue;
+            if (!value || value.byteLength === 0) continue;
 
-            // value is a Uint8Array view; use value.byteOffset/byteLength to construct
-            // a DataView that points to the actual bytes we received.
-            const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
-            const int16 = new Int16Array(value.byteLength / 2);
-            for (let i = 0; i < int16.length; i++) {
-                int16[i] = view.getInt16(i * 2, true);
+            let data = value;
+
+            // If we have a leftover byte from the previous chunk, prepend it
+            if (leftover) {
+                const merged = new Uint8Array(leftover.byteLength + value.byteLength);
+                merged.set(leftover, 0);
+                merged.set(value, leftover.byteLength);
+                data = merged;
+                leftover = null;
             }
 
-            const float32 = new Float32Array(int16.length);
-            for (let i = 0; i < int16.length; i++) {
-                float32[i] = int16[i] / 32768;
+            // If we have an odd number of bytes, save the last byte for the next round
+            if (data.byteLength % 2 !== 0) {
+                leftover = data.slice(data.byteLength - 1);
+                data = data.slice(0, data.byteLength - 1);
+            }
+
+            if (data.byteLength === 0) continue;
+
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const sampleCount = data.byteLength / 2;
+            const float32 = new Float32Array(sampleCount);
+
+            for (let i = 0; i < sampleCount; i++) {
+                float32[i] = view.getInt16(i * 2, true) / 32768;
             }
 
             const buffer = ttsAudioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
-            buffer.copyToChannel(float32, 0, 0);
+            buffer.copyToChannel(float32, 0);
 
             const src = ttsAudioCtx.createBufferSource();
             src.buffer = buffer;
             src.connect(ttsAnalyser);
-            // analyser is already connected to gain -> destination
             src.start(playTime);
             playTime += buffer.duration;
+            lastSource = src;
         }
+
     } catch (e) {
         console.error('Error reading TTS stream', e);
     } finally {
-        // let any remaining scheduled buffers play out, then restore state
-        const now = ttsAudioCtx.currentTime;
-        const timeUntilEnd = Math.max(0, playTime - now);
-        setTimeout(() => {
-            // close tts audio context
-            try { ttsAudioCtx.close(); } catch (e) {}
-            ttsAudioCtx = null;
-            ttsAnalyser = null;
-            ttsDataArray = null;
+        if (lastSource) {
+            lastSource.onended = () => {
+                try { ttsAudioCtx.close(); } catch (e) {}
+                ttsAudioCtx = null;
+                ttsAnalyser = null;
+                ttsDataArray = null;
+                state = prevState || STATE.IDLE;
+                setText('点击唤醒，让我听到你的声音');
+            };
+        } else {
+            // fallback
             state = prevState || STATE.IDLE;
-            setText('点击唤醒，让我听到你的声音');
-        }, (timeUntilEnd + 0.1) * 1000);
+        }
     }
 }
 
